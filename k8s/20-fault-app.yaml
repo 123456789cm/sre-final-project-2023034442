@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fault-switch
+  namespace: sre-demo
+data:
+  FAIL_MODE: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: faulty-app
+  namespace: sre-demo
+  labels:
+    app: faulty-app
+    sre.ai/managed: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: faulty-app
+  template:
+    metadata:
+      labels:
+        app: faulty-app
+        sre.ai/managed: "true"
+    spec:
+      containers:
+        - name: faulty-app
+          image: docker.io/library/alpine:offline-v1
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: fault-switch
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ "${FAIL_MODE}" = "true" ]; then
+                echo "SRE_DEMO_FAULT: FAIL_MODE=true; container exits with code 1"
+                exit 1
+              fi
+              echo "faulty-app is healthy; FAIL_MODE=false"
+              while true; do
+                echo "heartbeat: $(date -Iseconds)"
+                sleep 30
+              done
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

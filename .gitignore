@@ -1,0 +1,17 @@
+# 构建产物
+sre-agent-*.tar
+*.log
+
+# 临时文件
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# 编辑器配置
+.idea/
+.vscode/
+
+# 本地测试输出
+coverage.out
+/tmp/

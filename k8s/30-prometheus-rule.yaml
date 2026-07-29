@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pod-crash-alert
+  namespace: monitoring
+  labels:
+    release: prometheus-stack
+spec:
+  groups:
+    - name: sre-demo.rules
+      rules:
+        - alert: PodCrashLooping
+          expr: max by(namespace, pod) (kube_pod_container_status_waiting_reason{namespace="sre-demo", reason="CrashLoopBackOff"}) == 1
+          for: 15s
+          labels:
+            severity: critical
+            course: sre-final-project
+          annotations:
+            summary: "SRE demo pod is crash looping"
+            description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is in CrashLoopBackOff state."

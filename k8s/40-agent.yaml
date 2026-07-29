@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-agent
+  namespace: sre-demo
+  labels:
+    app: sre-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sre-agent
+  template:
+    metadata:
+      labels:
+        app: sre-agent
+    spec:
+      serviceAccountName: sre-agent-sa
+      containers:
+        - name: sre-agent
+          image: docker.io/library/sre-agent:student-v1
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: HTTP_ADDR
+              value: ":8080"
+            - name: PROMETHEUS_URL
+              value: "http://prometheus-stack-kube-prom-prometheus.monitoring.svc.cluster.local:9090"
+            - name: LLM_URL
+              value: "http://192.168.30.100:13533"
+            - name: LLM_MODEL
+              value: "qwen2.5-3b-instruct-q4_k_m.gguf"
+            - name: WATCH_NAMESPACE
+              value: "sre-demo"
+            - name: MANAGED_LABEL_KEY
+              value: "sre.ai/managed"
+            - name: MANAGED_LABEL_VALUE
+              value: "true"
+            - name: ALLOWED_DEPLOYMENT
+              value: "faulty-app"
+            - name: RECOVERY_CONFIGMAP
+              value: "fault-switch"
+            - name: POLL_INTERVAL_SECONDS
+              value: "15"
+            - name: VERIFY_TIMEOUT_SECONDS
+              value: "120"
+            - name: MINIMUM_CONFIDENCE
+              value: "0.60"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sre-agent-service
+  namespace: sre-demo
+spec:
+  type: NodePort
+  selector:
+    app: sre-agent
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30080

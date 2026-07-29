@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K8s SRE 智能运维助手</title>
+  <style>
+    :root { --bg:#f3f7f6; --panel:#fff; --primary:#0f5b4a; --text:#17352e; --muted:#6b7e79; --border:#d9e5e1; --ok:#087f5b; --warn:#b26a00; --bad:#c92a2a; --shadow:0 12px 30px rgba(15,91,74,.09); }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif; color:var(--text); background:linear-gradient(145deg,#eef7f4 0%,var(--bg) 48%,#f7faf9 100%); }
+    header { display:flex; justify-content:space-between; align-items:center; gap:20px; padding:24px 34px; color:#fff; background:linear-gradient(120deg,#0b493c,var(--primary)); box-shadow:var(--shadow); }
+    header h1 { margin:0 0 8px; font-size:28px; } header p { margin:0; opacity:.82; }
+    .header-state { min-width:190px; padding:14px 18px; border:1px solid rgba(255,255,255,.22); border-radius:12px; background:rgba(255,255,255,.10); text-align:center; }
+    .header-state strong { display:block; font-size:20px; margin-top:4px; }
+    main { max-width:1380px; margin:0 auto; padding:28px; }
+    .grid { display:grid; gap:18px; } .status-grid { grid-template-columns:repeat(4,minmax(0,1fr)); } .detail-grid { grid-template-columns:1.15fr 1fr; margin-top:18px; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:16px; box-shadow:var(--shadow); padding:20px; }
+    .card h2 { margin:0 0 16px; font-size:18px; } .metric-label { color:var(--muted); font-size:14px; } .metric-value { margin-top:10px; font-size:22px; font-weight:700; word-break:break-all; }
+    .badge { display:inline-flex; align-items:center; gap:7px; padding:5px 10px; border-radius:999px; font-size:13px; font-weight:700; background:#edf1f0; color:var(--muted); }
+    .badge.ok { color:var(--ok); background:#dff6ed; } .badge.warn { color:var(--warn); background:#fff3d6; } .badge.bad { color:var(--bad); background:#ffe3e3; }
+    .dot { width:8px; height:8px; border-radius:50%; background:currentColor; }
+    .section { padding:14px 0; border-top:1px solid var(--border); } .section:first-of-type { border-top:0; padding-top:0; }
+    .kv { display:grid; grid-template-columns:120px 1fr; gap:8px 14px; line-height:1.7; } .kv span:nth-child(odd) { color:var(--muted); }
+    pre { margin:10px 0 0; max-height:220px; overflow:auto; padding:14px; border-radius:10px; color:#d6f5ec; background:#102c27; white-space:pre-wrap; word-break:break-word; font-family:Consolas,"Courier New",monospace; font-size:13px; line-height:1.55; }
+    .timeline { display:flex; flex-direction:column; gap:10px; } .timeline-item { display:grid; grid-template-columns:80px 78px 1fr; gap:10px; align-items:start; padding:11px 12px; border:1px solid var(--border); border-radius:10px; background:#fbfdfc; }
+    .timeline-item time { color:var(--muted); font-size:12px; } .empty { color:var(--muted); padding:20px 0; text-align:center; }
+    footer { padding:18px 28px 30px; text-align:center; color:var(--muted); font-size:13px; }
+    @media (max-width:900px) { header { align-items:flex-start; flex-direction:column; } .status-grid,.detail-grid { grid-template-columns:1fr; } .timeline-item { grid-template-columns:72px 70px 1fr; } }
+  </style>
+</head>
+<body>
+<header><div><h1>K8s SRE 智能运维助手</h1><p>Prometheus 感知 · 本地 LLM 决策 · Kubernetes 受限自动恢复</p></div><div class="header-state">Agent 当前状态<strong id="agentStatus">正在连接</strong></div></header>
+<main>
+  <section class="grid status-grid">
+    <article class="card"><div class="metric-label">Prometheus</div><div class="metric-value" id="prometheusStatus">检测中</div></article>
+    <article class="card"><div class="metric-label">ai-node1 LLM</div><div class="metric-value" id="llmStatus">检测中</div></article>
+    <article class="card"><div class="metric-label">最近检测时间</div><div class="metric-value" id="lastCheck">--</div></article>
+    <article class="card"><div class="metric-label">最近恢复结果</div><div class="metric-value" id="recoveryStatus">尚未执行</div></article>
+  </section>
+  <section class="grid detail-grid"><article class="card"><h2>故障、决策与行动</h2><div id="incidentPanel" class="empty">当前还没有故障记录</div></article><article class="card"><h2>Agent 时间线</h2><div id="timeline" class="timeline"><div class="empty">等待 Agent 状态数据</div></div></article></section>
+</main>
+<footer>页面每 5 秒自动刷新；本实验仅允许操作 sre-demo 命名空间中的受管实验工作负载。</footer>
+<script>
+const text=(v,f="--")=>v===undefined||v===null||v===""?f:v;
+const escapeHtml=v=>String(v??"").replace(/[&<>'"]/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[ch]));
+const timeText=v=>v?new Date(v).toLocaleString("zh-CN",{hour12:false}):"--";
+const badge=(label,kind)=>`<span class="badge ${kind}"><span class="dot"></span>${escapeHtml(label)}</span>`;
+function updateSummary(d){document.getElementById("agentStatus").textContent=text(d.agentStatus,"unknown");document.getElementById("prometheusStatus").innerHTML=d.prometheusReachable?badge("连接正常","ok"):badge("连接异常","bad");document.getElementById("llmStatus").innerHTML=d.llmReachable?badge("连接正常","ok"):badge("连接异常","bad");document.getElementById("lastCheck").textContent=timeText(d.lastCheck);const a=d.lastAction;document.getElementById("recoveryStatus").innerHTML=!a?"尚未执行":a.success?badge("恢复成功","ok"):badge("恢复失败","bad");}
+function updateIncident(d){const i=d.lastIncident,dec=d.lastDecision,a=d.lastAction,p=document.getElementById("incidentPanel");if(!i){p.className="empty";p.textContent="当前还没有故障记录";return;}p.className="";p.innerHTML=`<div class="section"><div class="kv"><span>故障对象</span><strong>${escapeHtml(i.namespace)}/${escapeHtml(i.podName)}</strong><span>所属 Deployment</span><strong>${escapeHtml(i.deploymentName)}</strong><span>重启次数</span><strong>${escapeHtml(i.restartCount)}</strong><span>告警原因</span><strong>${escapeHtml(i.reason)}</strong></div><pre>${escapeHtml(i.previousLogs||"暂无日志")}</pre></div><div class="section"><div class="kv"><span>LLM 动作</span><strong>${escapeHtml(dec?.action||"--")}</strong><span>决策原因</span><strong>${escapeHtml(dec?.reason||"--")}</strong><span>置信度</span><strong>${dec?Number(dec.confidence).toFixed(2):"--"}</strong></div></div><div class="section"><div class="kv"><span>执行结果</span><strong>${a?(a.success?"成功":"失败"):"尚未执行"}</strong><span>结果说明</span><strong>${escapeHtml(a?.message||"--")}</strong><span>完成时间</span><strong>${timeText(a?.completedAt)}</strong></div></div>`;}
+function updateTimeline(d){const t=document.getElementById("timeline"),ev=Array.isArray(d.timeline)?d.timeline:[];if(!ev.length){t.innerHTML='<div class="empty">暂无事件</div>';return;}t.innerHTML=ev.map(e=>{const k=e.level==="success"?"ok":e.level==="error"?"bad":e.level==="warning"?"warn":"";return `<div class="timeline-item"><time>${new Date(e.time).toLocaleTimeString("zh-CN",{hour12:false})}</time>${badge(e.level,k)}<div>${escapeHtml(e.message)}</div></div>`}).join("");}
+async function refresh(){try{const r=await fetch("/api/status",{cache:"no-store"});if(!r.ok)throw new Error(`HTTP ${r.status}`);const d=await r.json();updateSummary(d);updateIncident(d);updateTimeline(d);}catch(e){document.getElementById("agentStatus").textContent="页面连接失败";document.getElementById("timeline").innerHTML=`<div class="empty">无法读取 /api/status：${escapeHtml(e.message)}</div>`;}}
+refresh();setInterval(refresh,5000);
+</script>
+</body>
+</html>
