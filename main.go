@@ -345,12 +345,57 @@ func runOneCycle(ctx context.Context, clientset *kubernetes.Clientset, cfg Confi
 // Alerts for Pods that have already disappeared are skipped because Prometheus can
 // retain an alert briefly after the recovery action has completed.
 func sense(ctx context.Context, clientset *kubernetes.Clientset, cfg Config) ([]Incident, error) {
-	// TODO-STUDENT-1：请求 Prometheus /api/v1/alerts，筛选 firing 的
-	// PodCrashLooping 告警，并调用 enrichIncident 补充 Kubernetes 上下文。
-	_ = ctx
-	_ = clientset
-	_ = cfg
-	return nil, errors.New("TODO-STUDENT-1: implement Prometheus sensing")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.PrometheusURL+"/api/v1/alerts", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create Prometheus request: %w", err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request Prometheus alerts: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Prometheus returned HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+	}
+
+	var promResp PrometheusAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&promResp); err != nil {
+		return nil, fmt.Errorf("decode Prometheus response: %w", err)
+	}
+
+	if promResp.Status != "success" {
+		return nil, fmt.Errorf("Prometheus API status: %s", promResp.Status)
+	}
+
+	var incidents []Incident
+	for _, alert := range promResp.Data.Alerts {
+		if alert.State != "firing" {
+			continue
+		}
+		if alert.Labels["alertname"] != "PodCrashLooping" {
+			continue
+		}
+
+		namespace := alert.Labels["namespace"]
+		podName := alert.Labels["pod"]
+		if namespace == "" || podName == "" {
+			continue
+		}
+
+		incident, err := enrichIncident(ctx, clientset, alert, namespace, podName, cfg.MaximumLogCharacters)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				continue
+			}
+			return nil, fmt.Errorf("enrich incident %s/%s: %w", namespace, podName, err)
+		}
+		incidents = append(incidents, incident)
+	}
+
+	return incidents, nil
 }
 
 func enrichIncident(ctx context.Context, clientset *kubernetes.Clientset, alert PrometheusAlert, namespace, podName string, maxLogChars int) (Incident, error) {
@@ -435,14 +480,74 @@ func readLatestPodEvent(ctx context.Context, clientset *kubernetes.Clientset, po
 }
 
 func decide(ctx context.Context, cfg Config, incident Incident) (Decision, error) {
-	// TODO-STUDENT-2：调用 ai-node1 的 /v1/chat/completions，要求模型只返回
-	// 一个 JSON 对象，再使用 extractJSONObject 和 json.Unmarshal 解析 Decision。
-	_ = ctx
-	_ = cfg
-	_ = incident
-	_ = bytes.NewReader(nil)
-	_, _ = json.Marshal(OpenAIChatRequest{})
-	return Decision{}, errors.New("TODO-STUDENT-2: implement structured LLM decision")
+	systemPrompt := "你是一个 SRE 运维助手。根据故障信息判断是否需要重启 Deployment。"
+	systemPrompt += "只返回一个 JSON 对象，不要附带任何其他文字。JSON 格式如下："
+	systemPrompt += `{"action":"restart_deployment 或 ignore","reason":"简短中文理由","confidence":0.0~1.0}`
+
+	userPrompt := fmt.Sprintf("故障信息：alert=%s namespace=%s pod=%s deployment=%s reason=%s phase=%s restartCount=%d lastEvent=%s logs=%s",
+		incident.AlertName, incident.Namespace, incident.PodName, incident.DeploymentName,
+		incident.Reason, incident.PodPhase, incident.RestartCount,
+		incident.LastEvent, incident.PreviousLogs)
+
+	chatReq := OpenAIChatRequest{
+		Model:       cfg.LLMModel,
+		Temperature: 0.1,
+		MaxTokens:   256,
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+	}
+
+	body, err := json.Marshal(chatReq)
+	if err != nil {
+		return Decision{}, fmt.Errorf("marshal chat request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.LLMURL+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return Decision{}, fmt.Errorf("create LLM request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return Decision{}, fmt.Errorf("request LLM: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return Decision{}, fmt.Errorf("LLM returned HTTP %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 200)]))
+	}
+
+	var chatResp OpenAIChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return Decision{}, fmt.Errorf("decode LLM response: %w", err)
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return Decision{}, errors.New("LLM returned no choices")
+	}
+
+	jsonText, err := extractJSONObject(chatResp.Choices[0].Message.Content)
+	if err != nil {
+		return Decision{}, err
+	}
+
+	var decision Decision
+	if err := json.Unmarshal([]byte(jsonText), &decision); err != nil {
+		return Decision{}, fmt.Errorf("parse decision JSON: %w", err)
+	}
+
+	if decision.Action != "restart_deployment" && decision.Action != "ignore" {
+		return Decision{}, fmt.Errorf("LLM returned invalid action: %s", decision.Action)
+	}
+	if decision.Confidence < 0 || decision.Confidence > 1 {
+		return Decision{}, fmt.Errorf("LLM returned invalid confidence: %.2f", decision.Confidence)
+	}
+
+	return decision, nil
 }
 
 func extractJSONObject(text string) (string, error) {
@@ -455,28 +560,105 @@ func extractJSONObject(text string) (string, error) {
 }
 
 func validateDecision(cfg Config, incident Incident, decision Decision) error {
-	// TODO-STUDENT-3：完成动作、置信度、命名空间、Deployment 和标签五项校验。
-	_ = cfg
-	_ = incident
-	_ = decision
-	return errors.New("TODO-STUDENT-3: implement the five safety checks")
+	// 校验1：动作必须是 restart_deployment 或 ignore
+	if decision.Action != "restart_deployment" && decision.Action != "ignore" {
+		return fmt.Errorf("未知的动作: %s", decision.Action)
+	}
+
+	// ignore 动作不需要后续校验
+	if decision.Action == "ignore" {
+		return nil
+	}
+
+	// 校验2：置信度必须达到最低阈值
+	if decision.Confidence < cfg.MinimumConfidence {
+		return fmt.Errorf("置信度 %.2f 低于最低阈值 %.2f", decision.Confidence, cfg.MinimumConfidence)
+	}
+
+	// 校验3：命名空间必须匹配
+	if incident.Namespace != cfg.Namespace {
+		return fmt.Errorf("命名空间不匹配: 期望 %s, 实际 %s", cfg.Namespace, incident.Namespace)
+	}
+
+	// 校验4：Deployment 必须在允许列表中
+	if incident.DeploymentName != cfg.AllowedDeployment {
+		return fmt.Errorf("Deployment %s 不在允许列表 (允许: %s)", incident.DeploymentName, cfg.AllowedDeployment)
+	}
+
+	// 校验5：Pod 必须带有受管标签
+	labelValue, ok := incident.Labels[cfg.ManagedLabelKey]
+	if !ok || labelValue != cfg.ManagedLabelValue {
+		return fmt.Errorf("Pod 缺少受管标签 %s=%s", cfg.ManagedLabelKey, cfg.ManagedLabelValue)
+	}
+
+	return nil
 }
 
 func actAndVerify(ctx context.Context, clientset *kubernetes.Clientset, cfg Config, incident Incident, decision Decision) ActionResult {
-	// TODO-STUDENT-4：把 fault-switch/FAIL_MODE 改为 false，删除已验证 Pod，
-	// 等待旧 Pod 消失并复检 Deployment Ready，完整填写 ActionResult。
-	_ = ctx
-	_ = clientset
-	_ = cfg
-	_ = incident
-	return ActionResult{
-		Action:      decision.Action,
-		Target:      incident.Namespace + "/" + incident.PodName,
-		Success:     false,
-		Message:     "TODO-STUDENT-4: implement restricted recovery and verification",
-		StartedAt:   time.Now(),
-		CompletedAt: time.Now(),
+	result := ActionResult{
+		Action:    decision.Action,
+		Target:    incident.Namespace + "/" + incident.PodName,
+		StartedAt: time.Now(),
 	}
+
+	if decision.Action == "ignore" {
+		result.Success = true
+		result.Message = "LLM 决策为忽略，无需执行恢复操作"
+		result.CompletedAt = time.Now()
+		return result
+	}
+
+	// 步骤1：将 fault-switch 的 FAIL_MODE 设为 false
+	cm, err := clientset.CoreV1().ConfigMaps(cfg.Namespace).Get(ctx, cfg.RecoveryConfigMap, metav1.GetOptions{})
+	if err != nil {
+		result.Success = false
+		result.Message = fmt.Sprintf("获取 ConfigMap %s/%s 失败: %v", cfg.Namespace, cfg.RecoveryConfigMap, err)
+		result.CompletedAt = time.Now()
+		return result
+	}
+
+	cm.Data["FAIL_MODE"] = "false"
+	_, err = clientset.CoreV1().ConfigMaps(cfg.Namespace).Update(ctx, cm, metav1.UpdateOptions{})
+	if err != nil {
+		result.Success = false
+		result.Message = fmt.Sprintf("更新 ConfigMap %s/%s 失败: %v", cfg.Namespace, cfg.RecoveryConfigMap, err)
+		result.CompletedAt = time.Now()
+		return result
+	}
+
+	// 步骤2：删除故障 Pod
+	err = clientset.CoreV1().Pods(incident.Namespace).Delete(ctx, incident.PodName, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		result.Success = false
+		result.Message = fmt.Sprintf("删除 Pod %s/%s 失败: %v", incident.Namespace, incident.PodName, err)
+		result.CompletedAt = time.Now()
+		return result
+	}
+
+	// 步骤3：等待 Pod 完全删除（带超时）
+	verifyCtx, cancel := context.WithTimeout(ctx, cfg.VerifyTimeout)
+	defer cancel()
+
+	if err := waitForPodDeleted(verifyCtx, clientset, incident.Namespace, incident.PodName); err != nil {
+		result.Success = false
+		result.Message = fmt.Sprintf("Pod %s/%s 在超时内未删除: %v", incident.Namespace, incident.PodName, err)
+		result.CompletedAt = time.Now()
+		return result
+	}
+
+	// 步骤4：等待 Deployment 完全就绪
+	if err := waitForDeploymentReady(verifyCtx, clientset, incident.Namespace, incident.DeploymentName); err != nil {
+		result.Success = false
+		result.Message = fmt.Sprintf("Deployment %s/%s 在超时内未就绪: %v", incident.Namespace, incident.DeploymentName, err)
+		result.CompletedAt = time.Now()
+		return result
+	}
+
+	result.Success = true
+	result.Message = fmt.Sprintf("成功恢复 %s/%s: FAIL_MODE 已设为 false, Pod 已删除, Deployment 已就绪",
+		incident.Namespace, incident.DeploymentName)
+	result.CompletedAt = time.Now()
+	return result
 }
 
 func waitForPodDeleted(ctx context.Context, clientset *kubernetes.Clientset, namespace, name string) error {
