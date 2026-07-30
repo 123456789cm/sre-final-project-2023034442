@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: "https://gitee.com/REPLACE_WITH_GITEE_USER/sre-final-project-template.git"
+    repoURL: "https://github.com/123456789cm/sre-final-project-2023034442.git"
     targetRevision: main
     path: k8s
   destination:
