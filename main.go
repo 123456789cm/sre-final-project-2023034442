@@ -194,6 +194,8 @@ func main() {
 			log.Printf("encode status response: %v", err)
 		}
 	})
+mux.HandleFunc("/api/diagnostics", diagnosticsHandler(cfg, clientset))
+	mux.HandleFunc("/api/run-now", runNowHandler(runNowCh, store))
 
 	frontendRoot, err := fs.Sub(frontendFiles, "frontend")
 	if err != nil {
