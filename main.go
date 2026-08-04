@@ -177,9 +177,10 @@ func main() {
 	}
 
 	store := NewStateStore()
+	runNowCh := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runAgentLoop(ctx, clientset, cfg, store)
+	go runAgentLoop(ctx, clientset, cfg, store, runNowCh)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -249,7 +250,7 @@ func loadConfig() (Config, error) {
 	return cfg, nil
 }
 
-func runAgentLoop(ctx context.Context, clientset *kubernetes.Clientset, cfg Config, store *StateStore) {
+func runAgentLoop(ctx context.Context, clientset *kubernetes.Clientset, cfg Config, store *StateStore, runNowCh <-chan struct{}) {
 	store.AddEvent("info", "Agent loop started")
 	runOneCycle(ctx, clientset, cfg, store)
 	ticker := time.NewTicker(cfg.PollInterval)
@@ -258,6 +259,9 @@ func runAgentLoop(ctx context.Context, clientset *kubernetes.Clientset, cfg Conf
 		select {
 		case <-ctx.Done():
 			return
+		case <-runNowCh:
+			store.AddEvent("info", "收到手动检测请求")
+			runOneCycle(ctx, clientset, cfg, store)
 		case <-ticker.C:
 			runOneCycle(ctx, clientset, cfg, store)
 		}
@@ -773,4 +777,169 @@ func envFloat(key string, fallback float64) (float64, error) {
 		return 0, fmt.Errorf("%s must be a number: %w", key, err)
 	}
 	return parsed, nil
+}
+
+// ── A4: /api/diagnostics ──
+
+type DiagCheck struct {
+	Name       string `json:"name"`
+	OK         bool   `json:"ok"`
+	Message    string `json:"message"`
+	DurationMs int64  `json:"durationMs"`
+}
+
+type DiagResponse struct {
+	Time    string      `json:"time"`
+	Overall string      `json:"overall"`
+	Checks  []DiagCheck `json:"checks"`
+}
+
+func diagnosticsHandler(cfg Config, clientset *kubernetes.Clientset) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "only GET allowed"})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		var checks []DiagCheck
+		allOK := true
+
+		// 1. Prometheus
+		start := time.Now()
+		code, msg := checkPrometheusReady(ctx, cfg)
+		elapsed := time.Since(start).Milliseconds()
+		ok := code == 200
+		checks = append(checks, DiagCheck{Name: "prometheus", OK: ok, Message: msg, DurationMs: elapsed})
+		if !ok {
+			allOK = false
+		}
+
+		// 2. LLM
+		start = time.Now()
+		code, msg = checkLLMModels(ctx, cfg)
+		elapsed = time.Since(start).Milliseconds()
+		ok = code == 200
+		checks = append(checks, DiagCheck{Name: "llm", OK: ok, Message: msg, DurationMs: elapsed})
+		if !ok {
+			allOK = false
+		}
+
+		// 3. Kubernetes API
+		start = time.Now()
+		_, err := clientset.Discovery().ServerVersion()
+		elapsed = time.Since(start).Milliseconds()
+		if err != nil {
+			checks = append(checks, DiagCheck{Name: "kubernetes-api", OK: false, Message: err.Error(), DurationMs: elapsed})
+			allOK = false
+		} else {
+			checks = append(checks, DiagCheck{Name: "kubernetes-api", OK: true, Message: "reachable", DurationMs: elapsed})
+		}
+
+		// 4. sre-demo namespace
+		start = time.Now()
+		_, err = clientset.CoreV1().Namespaces().Get(ctx, cfg.Namespace, metav1.GetOptions{})
+		elapsed = time.Since(start).Milliseconds()
+		if err != nil {
+			checks = append(checks, DiagCheck{Name: "namespace", OK: false, Message: err.Error(), DurationMs: elapsed})
+			allOK = false
+		} else {
+			checks = append(checks, DiagCheck{Name: "namespace", OK: true, Message: cfg.Namespace + " exists", DurationMs: elapsed})
+		}
+
+		// 5. faulty-app Deployment
+		start = time.Now()
+		_, err = clientset.AppsV1().Deployments(cfg.Namespace).Get(ctx, cfg.AllowedDeployment, metav1.GetOptions{})
+		elapsed = time.Since(start).Milliseconds()
+		if err != nil {
+			checks = append(checks, DiagCheck{Name: "faulty-app", OK: false, Message: err.Error(), DurationMs: elapsed})
+			allOK = false
+		} else {
+			checks = append(checks, DiagCheck{Name: "faulty-app", OK: true, Message: cfg.AllowedDeployment + " exists", DurationMs: elapsed})
+		}
+
+		// 6. sre-agent Deployment
+		start = time.Now()
+		_, err = clientset.AppsV1().Deployments(cfg.Namespace).Get(ctx, "sre-agent", metav1.GetOptions{})
+		elapsed = time.Since(start).Milliseconds()
+		if err != nil {
+			checks = append(checks, DiagCheck{Name: "sre-agent", OK: false, Message: err.Error(), DurationMs: elapsed})
+			allOK = false
+		} else {
+			checks = append(checks, DiagCheck{Name: "sre-agent", OK: true, Message: "sre-agent exists", DurationMs: elapsed})
+		}
+
+		overall := "ok"
+		if !allOK {
+			overall = "degraded"
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(DiagResponse{
+			Time:    time.Now().Format(time.RFC3339),
+			Overall: overall,
+			Checks:  checks,
+		})
+	}
+}
+
+func checkPrometheusReady(ctx context.Context, cfg Config) (int, string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.PrometheusURL+"/-/ready", nil)
+	if err != nil {
+		return 0, err.Error()
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 200 {
+		return 200, "ready"
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body[:min(len(body), 100)])
+}
+
+func checkLLMModels(ctx context.Context, cfg Config) (int, string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.LLMURL+"/v1/models", nil)
+	if err != nil {
+		return 0, err.Error()
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 200 {
+		return 200, "reachable"
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body[:min(len(body), 100)])
+}
+
+// ── C2: /api/run-now ──
+
+func runNowHandler(runNowCh chan<- struct{}, store *StateStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "only POST allowed"})
+			return
+		}
+
+		select {
+		case runNowCh <- struct{}{}:
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "message": "已加入检测队列"})
+		default:
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{"status": "conflict", "message": "已有检测请求等待中"})
+		}
+	}
 }

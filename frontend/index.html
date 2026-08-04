@@ -29,7 +29,7 @@
   </style>
 </head>
 <body>
-<header><div><h1>K8s SRE 智能运维助手</h1><p>Prometheus 感知 · 本地 LLM 决策 · Kubernetes 受限自动恢复</p></div><div class="header-state">Agent 当前状态<strong id="agentStatus">正在连接</strong></div></header>
+<header><div><h1>K8s SRE 智能运维助手</h1><p>Prometheus 感知 · 本地 LLM 决策 · Kubernetes 受限自动恢复</p></div><div class="header-state">Agent 当前状态<strong id="agentStatus">正在连接</strong></div><button id="runNowBtn" onclick="runNowCheck()" style="background:rgba(255,255,255,.18);color:#fff;border:1px solid rgba(255,255,255,.28);border-radius:12px;padding:14px 24px;font-size:15px;font-weight:700;cursor:pointer;transition:all .2s;" onmouseover="this.style.background="rgba(255,255,255,.28)"" onmouseout="this.style.background="rgba(255,255,255,.18)"">⚡ 立即检测</button></header>
 <main>
   <section class="grid status-grid">
     <article class="card"><div class="metric-label">Prometheus</div><div class="metric-value" id="prometheusStatus">检测中</div></article>
@@ -50,6 +50,7 @@ function updateIncident(d){const i=d.lastIncident,dec=d.lastDecision,a=d.lastAct
 function updateTimeline(d){const t=document.getElementById("timeline"),ev=Array.isArray(d.timeline)?d.timeline:[];if(!ev.length){t.innerHTML='<div class="empty">暂无事件</div>';return;}t.innerHTML=ev.map(e=>{const k=e.level==="success"?"ok":e.level==="error"?"bad":e.level==="warning"?"warn":"";return `<div class="timeline-item"><time>${new Date(e.time).toLocaleTimeString("zh-CN",{hour12:false})}</time>${badge(e.level,k)}<div>${escapeHtml(e.message)}</div></div>`}).join("");}
 async function refresh(){try{const r=await fetch("/api/status",{cache:"no-store"});if(!r.ok)throw new Error(`HTTP ${r.status}`);const d=await r.json();updateSummary(d);updateIncident(d);updateTimeline(d);}catch(e){document.getElementById("agentStatus").textContent="页面连接失败";document.getElementById("timeline").innerHTML=`<div class="empty">无法读取 /api/status：${escapeHtml(e.message)}</div>`;}}
 refresh();setInterval(refresh,5000);
+async function runNowCheck(){const b=document.getElementById("runNowBtn");b.disabled=true;b.textContent="⏳ 排队中...";try{const r=await fetch("/api/run-now",{method:"POST"});const j=await r.json();if(r.status===202){b.textContent="✅ 已触发";setTimeout(()=>{b.textContent="⚡ 立即检测";b.disabled=false},3000)}else if(r.status===409){b.textContent="⚠ "+j.message;setTimeout(()=>{b.textContent="⚡ 立即检测";b.disabled=false},3000)}else{b.textContent="❌ 失败";setTimeout(()=>{b.textContent="⚡ 立即检测";b.disabled=false},3000)}}catch(e){b.textContent="❌ 网络错误";setTimeout(()=>{b.textContent="⚡ 立即检测";b.disabled=false},3000)}}
 </script>
 </body>
 </html>
