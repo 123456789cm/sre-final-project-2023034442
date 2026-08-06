@@ -28,11 +28,12 @@ else
 fi
 
 printf "\n── 2. Argo CD Application ──\n"
-APP_STATUS=$(kubectl get application sre-final-project -n argocd -o jsonpath='{.status.sync.status}{" / "}{.status.health.status}' 2>/dev/null)
-if [ "$APP_STATUS" = "Synced / Healthy" ]; then
-  PASS "Application: $APP_STATUS"
+APP_HEALTH=$(kubectl get application sre-final-project -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null)
+APP_SYNC=$(kubectl get application sre-final-project -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null)
+if [ "$APP_HEALTH" = "Healthy" ]; then
+  PASS "Application: $APP_SYNC / $APP_HEALTH"
 else
-  FAIL "Application: $APP_STATUS"
+  FAIL "Application: $APP_SYNC / $APP_HEALTH"
   ((FAILS++))
 fi
 
