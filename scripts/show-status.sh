@@ -7,9 +7,9 @@ FAIL()  { printf "  [\033[31mFAIL\033[0m] %s\n" "$*"; }
 INFO()  { printf "  [INFO]  %s\n" "$*"; }
 SEP()   { printf -- "----------------------------------------\n"; }
 
-PROMETHEUS_URL="http://prometheus-stack-kube-prom-prometheus.monitoring.svc.cluster.local:9090"
+PROMETHEUS_URL="http://192.168.30.15:30090"
 LLM_URL="http://192.168.30.100:13533"
-DASHBOARD_URL="http://localhost:8080"
+DASHBOARD_URL="http://192.168.30.15:30080"
 AGENT_NS="sre-demo"
 FAILS=0
 
